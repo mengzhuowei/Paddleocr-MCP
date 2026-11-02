@@ -1,0 +1,4 @@
+# 推理后端需单独安装。GPU 用户请安装 paddlepaddle-gpu，不要同时装 CPU 版。
+paddlepaddle>=3.0
+paddleocr>=3.0
+mcp>=2.0,<3
