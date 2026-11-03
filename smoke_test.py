@@ -59,6 +59,21 @@ async def main() -> None:
             )
             assert "Hello PaddleOCR 123" in single["text"], single
 
+            oriented = _payload(
+                await session.call_tool("ocr_image", {
+                    "image_path": str(IMAGE), "use_textline_orientation": True,
+                }),
+                "ocr_image(orientation)",
+            )
+            assert "Hello PaddleOCR 123" in oriented["text"], oriented
+
+            missing = await session.call_tool("ocr_image", {
+                "image_path": str(ROOT / "missing.png"),
+            })
+            assert missing.is_error, missing
+            assert "图片不存在" in missing.content[0].text, missing
+            print("ocr_image(missing): descriptive MCP error received")
+
             encoded = "data:image/png;base64," + base64.b64encode(IMAGE.read_bytes()).decode()
             encoded = encoded[:40] + "\n" + encoded[40:]
             b64 = _payload(

@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -20,6 +21,7 @@ os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "0")
 os.environ.setdefault("GLOG_minloglevel", "2")
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 __version__ = "0.1.0"
@@ -52,7 +54,26 @@ _engine_lock = threading.Lock()
 
 
 def _log(message: str) -> None:
-    print(f"[paddleocr-mcp] {message}", file=sys.stderr, flush=True)
+    try:
+        print(f"[paddleocr-mcp] {message}", file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        # A disconnected Windows stderr pipe must not break model loading.
+        pass
+
+
+def _configure_server_logging() -> Path:
+    """Keep diagnostics off stdout and independent of the client's stderr pipe."""
+    local_data = Path(os.environ.get("LOCALAPPDATA") or (
+        Path.home() / "AppData" / "Local" if os.name == "nt" else Path.home() / ".local" / "state"
+    ))
+    log_root = Path(os.environ.get("PADDLEOCR_MCP_LOG_DIR") or (
+        local_data / "PaddleOCR-MCP" / "logs"
+    ))
+    log_root.mkdir(parents=True, exist_ok=True)
+    log_path = log_root / f"server-{os.getpid()}.log"
+    sys.stderr = log_path.open("a", encoding="utf-8", buffering=1)
+    _log(f"pid={os.getpid()} diagnostic log: {log_path}")
+    return log_path
 
 
 def _normalize_lang(lang: str) -> str:
@@ -198,10 +219,11 @@ def _run_ocr(
         with infer_lock:
             results = engine.predict(image)
     except Exception as exc:
+        _log(traceback.format_exc())
         raise RuntimeError(
-            f"OCR 失败: {exc}\n"
-            "请确认已安装 paddlepaddle (pip install paddlepaddle)，"
-            f"并且 lang={language!r} 是 PaddleOCR 支持的语言。"
+            f"OCR 失败（{type(exc).__name__}）: {exc}; "
+            f"lang={language!r}, use_textline_orientation={use_textline_orientation}. "
+            "详细堆栈见 PaddleOCR-MCP 日志目录。"
         ) from exc
 
     pages = [_page_payload(item, include_boxes, min_confidence) for item in (results or [])]
@@ -272,15 +294,20 @@ async def ocr_image(
     Recognize text in one local image (file path or base64). Returns the full
     text, per-line text with confidence, and optional bounding boxes.
     """
-    return await asyncio.to_thread(
-        _run_ocr,
-        image_path=image_path,
-        image_base64=image_base64,
-        lang=lang,
-        min_confidence=min_confidence,
-        include_boxes=include_boxes,
-        use_textline_orientation=use_textline_orientation,
-    )
+    try:
+        return await asyncio.to_thread(
+            _run_ocr,
+            image_path=image_path,
+            image_base64=image_base64,
+            lang=lang,
+            min_confidence=min_confidence,
+            include_boxes=include_boxes,
+            use_textline_orientation=use_textline_orientation,
+        )
+    except (ValueError, RuntimeError) as exc:
+        # MCP 2.x intentionally hides unexpected exception messages. Mark known
+        # input/inference failures as ToolError so callers receive the reason.
+        raise ToolError(str(exc)) from exc
 
 
 @mcp.tool()
@@ -350,6 +377,7 @@ def _warmup() -> None:
 
 
 def main() -> None:
+    _configure_server_logging()
     if PRELOAD:
         threading.Thread(target=_warmup, name="paddleocr-warmup", daemon=True).start()
     mcp.run(transport="stdio")
